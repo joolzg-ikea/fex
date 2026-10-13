@@ -1,0 +1,43 @@
+name: Sanitizers
+
+on:
+  push:
+    branches: [ main, master, validation-fixes ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  asan-ubsan:
+    name: Build and test (ASan + UBSan)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential
+
+      - name: Configure (Debug + sanitizers)
+        run: |
+          mkdir -p build-asan
+          cd build-asan
+          cmake -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_FLAGS_DEBUG="-g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -Wall -Wextra -Wpedantic -fPIC" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" ..
+
+      - name: Build
+        run: cmake --build build-asan --parallel
+
+      - name: Run tests
+        run: |
+          cd build-asan
+          ctest --output-on-failure
+
+      - name: Smoke test with LD_PRELOAD
+        run: |
+          set -e
+          export LD_PRELOAD="$(gcc -print-file-name=libasan.so):$PWD/build-asan/src/libfex.so"
+          FEX_DEBUG=0 ./build-asan/src/test_app
+          unset LD_PRELOAD
