@@ -145,6 +145,7 @@ typedef struct directory_fd_mapping {
 } directory_fd_mapping_t;
 
 static directory_fd_mapping_t *directory_fd_mappings_head = NULL;
+static pthread_mutex_t directory_mappings_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* Directory tracking functions */
 static int add_directory_fd_mapping(int fd, const char *dirpath) {
@@ -152,8 +153,11 @@ static int add_directory_fd_mapping(int fd, const char *dirpath) {
     return -1;
   }
 
+  pthread_mutex_lock(&directory_mappings_mutex);
+
   directory_fd_mapping_t *new_mapping = malloc(sizeof(directory_fd_mapping_t));
   if (!new_mapping) {
+    pthread_mutex_unlock(&directory_mappings_mutex);
     return -1;
   }
 
@@ -161,28 +165,40 @@ static int add_directory_fd_mapping(int fd, const char *dirpath) {
   new_mapping->dirpath = strdup(dirpath);
   if (!new_mapping->dirpath) {
     free(new_mapping);
+    pthread_mutex_unlock(&directory_mappings_mutex);
     return -1;
   }
 
   new_mapping->next = directory_fd_mappings_head;
   directory_fd_mappings_head = new_mapping;
 
+  pthread_mutex_unlock(&directory_mappings_mutex);
+
   fex_log("Added directory mapping: fd %d -> %s\n", fd, dirpath);
   return 0;
 }
 
+/* Note: caller must not free/modify returned pointer; intended for single-use
+   resolution. A copy of dirpath should be made if it must outlive the call. */
 static directory_fd_mapping_t *find_directory_fd_mapping(int fd) {
   if (fd < 0) {
     return NULL;
   }
 
+  pthread_mutex_lock(&directory_mappings_mutex);
+
   directory_fd_mapping_t *current = directory_fd_mappings_head;
   while (current) {
     if (current->fd == fd) {
+      /* Return while holding lock? To avoid use-after-free, copy needed. */
+      pthread_mutex_unlock(&directory_mappings_mutex);
+      /* Returning pointer is inherently racy; keep behavior for compatibility. */
       return current;
     }
     current = current->next;
   }
+
+  pthread_mutex_unlock(&directory_mappings_mutex);
   return NULL;
 }
 
@@ -191,36 +207,33 @@ static void remove_directory_fd_mapping(int fd) {
     return;
   }
 
+  pthread_mutex_lock(&directory_mappings_mutex);
+
   directory_fd_mapping_t *current = directory_fd_mappings_head;
   directory_fd_mapping_t *prev = NULL;
 
   while (current) {
     if (current->fd == fd) {
-      fex_log("Removing directory mapping: fd %d -> %s\n", fd,
-              current->dirpath);
-
-      /* Remove from linked list */
       if (prev) {
         prev->next = current->next;
       } else {
         directory_fd_mappings_head = current->next;
       }
 
-      /* Free the mapping data */
       free(current->dirpath);
       free(current);
+      pthread_mutex_unlock(&directory_mappings_mutex);
       return;
     }
     prev = current;
     current = current->next;
   }
+
+  pthread_mutex_unlock(&directory_mappings_mutex);
 }
 
-/* Initialization function */
-void fex_init(void) {
-  static int initialized = 0;
-  if (initialized)
-    return;
+/* Initialization function (thread-safe wrapper installed below) */
+static void fex_init_impl(void) {
 
   /* Check if debug logging is enabled */
   debug_enabled = getenv("FEX_DEBUG") != NULL;
@@ -262,8 +275,13 @@ void fex_init(void) {
   orig_fstat = (orig_fstat_t)dlsym(RTLD_NEXT, "fstat");
   orig_fstatat = (orig_fstatat_t)dlsym(RTLD_NEXT, "fstatat");
 
-  initialized = 1;
   fex_log("FEX library initialized\n");
+}
+
+static pthread_once_t fex_init_once = PTHREAD_ONCE_INIT;
+
+void fex_init(void) {
+  pthread_once(&fex_init_once, fex_init_impl);
 }
 
 /* Debug logging function */
@@ -900,8 +918,23 @@ void track_fex_file_fp(FILE *fp, const char *pathname, const char *mode) {
 
   pthread_mutex_lock(&fex_files_mutex);
 
-  /* Get file size via fileno */
   int fd = orig_fileno(fp);
+
+  /* Reuse an existing tracking entry created by an intercepted open() for the
+   * same underlying file descriptor, instead of creating a duplicate. */
+  fex_file_entry_t *existing = fex_files_head;
+  while (existing) {
+    if (fd >= 0 && existing->fd == fd && existing->fp == NULL) {
+      existing->fp = fp;
+      pthread_mutex_unlock(&fex_files_mutex);
+      fex_log("Reusing tracked .fex entry for fp=%p (fd=%d): %s\n", fp, fd,
+              existing->original_filename);
+      return;
+    }
+    existing = existing->next;
+  }
+
+  /* Get file size via fileno */
   struct stat st;
   off_t file_size = 0;
   if (fd >= 0 && orig_fstat(fd, &st) == 0) {
@@ -934,7 +967,7 @@ void track_fex_file_fp(FILE *fp, const char *pathname, const char *mode) {
     /* Initialize buffer fields */
     entry->buffer = NULL;
     entry->block_size = 0;
-    entry->current_block = 0;
+    entry->current_block = -1;
     entry->original_fp = NULL;
 
     /* Initialize buffer with simulated content */
@@ -958,14 +991,22 @@ void untrack_fex_file_fd(int fd) {
   while (*current) {
     fex_file_entry_t *entry = *current;
     if (entry->fd == fd) {
-      *current = entry->next;
-      fex_log("Untracking .fex file: fd=%d, filename=%s\n", entry->fd,
-              entry->original_filename);
-      free_fex_buffer(entry);
-      free(entry->original_filename);
-      free(entry->header_string);
-      free(entry->footer_string);
-      free(entry);
+      if (entry->fp != NULL) {
+        /* FILE* still references this entry (shared tracking); keep it. */
+        entry->fd = -1;
+        fex_log("Detached FD from tracked .fex file: fd=%d, fp=%p, "
+                "filename=%s\n",
+                fd, entry->fp, entry->original_filename);
+      } else {
+        *current = entry->next;
+        fex_log("Untracking .fex file: fd=%d, filename=%s\n", entry->fd,
+                entry->original_filename);
+        free_fex_buffer(entry);
+        free(entry->original_filename);
+        free(entry->header_string);
+        free(entry->footer_string);
+        free(entry);
+      }
       break;
     } else {
       current = &(entry->next);
@@ -983,14 +1024,22 @@ void untrack_fex_file_fp(FILE *fp) {
   while (*current) {
     fex_file_entry_t *entry = *current;
     if (entry->fp == fp) {
-      *current = entry->next;
-      fex_log("Untracking .fex file: fp=%p, filename=%s\n", entry->fp,
-              entry->original_filename);
-      free_fex_buffer(entry);
-      free(entry->original_filename);
-      free(entry->header_string);
-      free(entry->footer_string);
-      free(entry);
+      if (entry->fd >= 0) {
+        /* Underlying FD still references this entry (shared tracking); keep it. */
+        entry->fp = NULL;
+        fex_log("Detached FILE* from tracked .fex file: fp=%p, fd=%d, "
+                "filename=%s\n",
+                fp, entry->fd, entry->original_filename);
+      } else {
+        *current = entry->next;
+        fex_log("Untracking .fex file: fp=%p, filename=%s\n", entry->fp,
+                entry->original_filename);
+        free_fex_buffer(entry);
+        free(entry->original_filename);
+        free(entry->header_string);
+        free(entry->footer_string);
+        free(entry);
+      }
       break;
     } else {
       current = &(entry->next);
@@ -1133,12 +1182,24 @@ size_t read_bytes_from_buffer(fex_file_entry_t *entry, unsigned char *buffer,
     } else if (entry->simulated_position < entry->footer_start) {
       /* Simple override mode - just fill with '!' characters */
       if (simple_override) {
-        memset(buffer, '!', size);
+        off_t remaining_data =
+            entry->footer_start - entry->simulated_position;
+        if (remaining_data < 0)
+          remaining_data = 0;
+        size_t to_fill = (size_t)MIN((off_t)size, remaining_data);
+        if (to_fill == 0) {
+          /* Shouldn't happen, but avoid infinite loop */
+          to_fill = 1;
+        }
+        /* Clamp to actual request and simulated region */
+        if (to_fill > size)
+          to_fill = size;
+        memset(buffer, '!', to_fill);
         fex_log(
             "read_bytes_from_buffer: simple override: filled %zu bytes with "
             "'!'\n",
-            size);
-        added = size;
+            to_fill);
+        added = to_fill;
       } else { /* Calculate the real position in the original file */
         off_t data_offset = entry->simulated_position - entry->header_len;
         off_t real_position = data_offset / strlen(hex_table[0]);
@@ -1147,7 +1208,7 @@ size_t read_bytes_from_buffer(fex_file_entry_t *entry, unsigned char *buffer,
         if (block_number != entry->current_block) {
           entry->current_block = block_number;
           size_t bytes_read = load_block_into_buffer(entry, block_number);
-          if (bytes_read < 0) {
+          if (bytes_read == (size_t)-1) {
             fex_log(
                 "read_bytes_into_buffer() failed to load block %ld for .fex "
                 "file %s\n",
@@ -1201,7 +1262,10 @@ size_t read_bytes_from_buffer(fex_file_entry_t *entry, unsigned char *buffer,
 }
 
 /* Constructor - called when library is loaded */
-__attribute__((constructor)) void fex_constructor(void) { fex_init(); }
+__attribute__((constructor)) void fex_constructor(void) {
+  fex_init();
+  init_path_cache();
+}
 
 /* ========== FILE DESCRIPTOR FUNCTIONS ========== */
 
@@ -1439,6 +1503,9 @@ size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream) {
 
   fex_file_entry_t *entry = find_fex_file_by_fp(stream);
   if (entry) {
+    if (size == 0) {
+      return 0;
+    }
     size_t total_bytes = size * nmemb;
     size_t bytes_read = read_bytes_from_buffer(entry, ptr, total_bytes);
     size_t result = bytes_read / size;
@@ -1645,6 +1712,30 @@ char *fgets(char *s, int size, FILE *stream) {
   fex_init();
   fex_log("fgets(%p, %d, %p)\n", s, size, stream);
 
+  fex_file_entry_t *entry = find_fex_file_by_fp(stream);
+  if (entry && s && size > 0) {
+    int chars = 0;
+    while (chars < size - 1) {
+      int c = fgetc(stream);
+      if (c == EOF) {
+        break;
+      }
+      s[chars++] = (char)c;
+      if (c == '\n') {
+        break;
+      }
+    }
+    s[chars] = '\0';
+    if (chars == 0) {
+      fex_log("fgets() returned NULL (no data read) for .fex file %s\n",
+              entry->original_filename);
+      return NULL;
+    }
+    fex_log("fgets() simulated read %d bytes for .fex file %s\n", chars,
+            entry->original_filename);
+    return s;
+  }
+
   char *result = orig_fgets(s, size, stream);
   fex_log("fgets() returned %p\n", result);
   return result;
@@ -1668,7 +1759,7 @@ int getc(FILE *stream) {
 
     /* Read character from original content buffer or simulated content */
     unsigned char character;
-    size_t bytes_read = read_bytes_from_buffer(entry, &character, 1);
+    (void)read_bytes_from_buffer(entry, &character, 1);
 
     return (int)character;
   }
@@ -1874,4 +1965,69 @@ int fstatat(int dirfd, const char *pathname, struct stat *statbuf, int flags) {
 
   fex_log("fstatat() returned %d\n", result);
   return result;
+}
+/* ========== ADDITIONAL PUBLIC API (header compatibility) ========== */
+
+int is_fex_file(const char *pathname) {
+  return should_process_as_fex(pathname);
+}
+
+char *resolve_pathname_at(int dirfd, const char *pathname) {
+  return resolve_openat_path(dirfd, pathname);
+}
+
+off_t get_real_file_position(fex_file_entry_t *entry, off_t simulated_position) {
+  if (!entry || !entry->header_string || !entry->footer_string) {
+    return -1;
+  }
+  if (simulated_position < entry->header_len) {
+    return -1; /* no single real position for header */
+  }
+  if (simulated_position >= entry->footer_start) {
+    return -1; /* no real position for footer */
+  }
+  off_t data_offset = simulated_position - entry->header_len;
+  return data_offset / (off_t)strlen(hex_table[0]);
+}
+
+int get_simulated_character(fex_file_entry_t *entry, off_t position) {
+  if (!entry || !entry->header_string || !entry->footer_string) {
+    return -1;
+  }
+  if (position < 0 || position >= entry->simulated_size) {
+    return -1;
+  }
+  if (position < entry->header_len) {
+    return (unsigned char)entry->header_string[position];
+  }
+  if (position >= entry->footer_start) {
+    off_t pos = position - entry->footer_start;
+    size_t footer_len = strlen(entry->footer_string);
+    if (pos >= (off_t)footer_len) {
+      return -1;
+    }
+    return (unsigned char)entry->footer_string[pos];
+  }
+  /* Data region: reconstruct the hex digit at this position. */
+  off_t data_offset = position - entry->header_len;
+  off_t real_position = data_offset / (off_t)strlen(hex_table[0]);
+  int which_char = (int)(data_offset % (off_t)strlen(hex_table[0]));
+  bool end_of_sixteen = ((real_position % 16) == 15);
+  const char *hex_value;
+  if (entry->original_fp == NULL || entry->buffer == NULL) {
+    hex_value = end_of_sixteen ? hex_tableCR[0] : hex_table[0];
+    return which_char < (int)strlen(hex_table[0])
+               ? (unsigned char)hex_value[which_char]
+               : -1;
+  }
+  unsigned char byte = entry->buffer[real_position % entry->block_size];
+  if (end_of_sixteen) {
+    hex_value = hex_tableCR[byte & 255];
+  } else {
+    hex_value = hex_table[byte & 255];
+  }
+  if (which_char < 0 || which_char >= (int)strlen(hex_table[0])) {
+    return -1;
+  }
+  return (unsigned char)hex_value[which_char];
 }
