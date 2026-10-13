@@ -1,8 +1,5 @@
 name: Sanitizers
 
-permissions:
-  contents: read
-
 on:
   push:
     branches: [ main, master, validation-fixes ]
@@ -41,6 +38,6 @@ jobs:
       - name: Smoke test with LD_PRELOAD
         run: |
           set -e
-          export LD_PRELOAD="$(gcc -print-file-name=libasan.so):$PWD/build-asan/src/libfex.so"
+          export LD_PRELOAD="$PWD/build-asan/src/libfex.so"
           FEX_DEBUG=0 ./build-asan/src/test_app
           unset LD_PRELOAD
